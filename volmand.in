@@ -1,0 +1,507 @@
+#!/bin/sh
+#
+# Volume manager daemon for FreeBSD's devd(8)
+# version 0.7
+
+if [ "${1}" != "daemon" ]; then
+	daemon -cf -p /var/run/volmand.pid %%PREFIX%%/sbin/volmand daemon
+	exit $?
+fi
+
+if [ -r %%PREFIX%%/etc/volman.conf ]; then
+	. %%PREFIX%%/etc/volman.conf
+fi
+
+: ${WRKDIR:=/tmp/volman}
+: ${DEVMATCH:="^(da|mmcsd)"}
+: ${LABELMATCH:="^(msdosfs|ntfs|ufs)/"}
+: ${MNTPREFIX=/media}
+: ${DEVMPOINT=NO}
+
+cleanup () {
+	trap - 1 15 EXIT
+	rm -rf ${WRKDIR}
+	kill -1 -${MASTERPID}
+	kill -15 -${MASTERPID}
+	exit 0
+}
+
+log () {
+	local level
+	level=${1}
+	shift
+	logger -p user.${level} -t volmand $*
+}
+
+pollDev () {
+	local status
+	status=0
+	while true; do
+		log info polling ${1}
+		sleep 5
+		if camcontrol tur ${1} >/dev/null 2>/dev/null; then
+			[ ${status} -eq 0 ] || continue
+			status=1
+			echo "!system=DEVFS subsystem=CDEV type=CREATE cdev=${1}" >${WRKDIR}/internal
+			sleep 1
+			:>/dev/${1}
+		else
+			if ! camcontrol devlist |grep -q "[(,]${1}[,)]"; then
+				log info lost device ${1}
+				echo "!system=VOLMAND _poller ENDPOLL ${1}" >${WRKDIR}/internal
+				return 0
+			fi
+			[ ${status} -eq 1 ] || continue
+			status=0
+			echo "!system=DEVFS subsystem=CDEV type=DESTROY cdev=${1}" >${WRKDIR}/internal
+		fi
+	done
+}
+
+probeMagic () {
+	local probe size
+	probe=$(dd if=/dev/${1} bs=128k count=1 2>/dev/null |file -Ls /dev/stdin)
+	size=$(diskinfo ${1} |cut -f 3 -d "	")
+	case "${probe}" in
+	*FAT*)
+		addDev ${1} ${size} msdosfs
+		return 0
+		;;
+	*Linux*ext2*)
+		addDev ${1} ${size} ext2fs
+		return 0
+		;;
+	*NTFS*)
+		addDev ${1} ${size} ntfs
+		return 0
+		;;
+	esac
+	return 1
+}
+
+probeDev () {
+	local dev gtype gprov gsize status pollpid mntcmd
+	dev=$1
+	eval "status=\$STATUS_${dev}"
+	eval "pollpid=\$POLLPID_${dev}"
+	if [ -n "${status}" ]; then return 0; fi
+	if [ -z "${pollpid}" ]; then
+		if camcontrol devlist |grep -q "[(,]${dev}[,)]"; then
+			if ! camcontrol tur ${dev} >/dev/null; then
+				pollDev ${dev} &
+				eval "POLLPID_${dev}=$!"
+				log info forking poller at PID $!
+				return 1
+			fi
+		fi
+	fi
+	if [ ${OSREL} -lt 802503 ]; then
+		probe=$(gpart show -r ${dev} 2>/dev/null)
+	else
+		probe=$(gpart show -rp ${dev} 2>/dev/null)
+	fi
+	if [ $? -ne 0 ]; then
+		probeMagic ${dev}
+		return $?
+	fi
+	IFS="
+"
+	for line in ${probe}; do
+		IFS=" 	"
+		set -- ${line}
+		[ "${3}" != "-" ] || continue
+		if [ "${1}" = "=>" ]; then
+			shift
+			gtype=${4}
+			continue
+		fi
+		if [ ${OSREL} -lt 802503 ]; then
+			gprov=$(gpart modify -i ${3} -f x ${dev} 2>/dev/null |cut -f 1 -d " ")
+			gpart undo ${dev} >/dev/null 2>&1
+		else
+			gprov=${3}
+		fi
+		gsize=$(diskinfo ${gprov} |cut -f 3 -d "	")
+		case "${gtype}" in
+		MBR)
+			case "${4}" in
+			1|4|5|6|12|13|15|16)
+				addDev ${gprov} ${gsize} msdosfs
+				;;
+			7)
+				if dd if=/dev/${gprov} bs=128k count=1 2>/dev/null \
+					|file -Ls /dev/stdin |grep -q "NTFS"; then
+					addDev ${gprov} ${gsize} ntfs
+				fi
+				;;
+			83)
+				if dd if=/dev/${gprov} bs=128k count=1 2>/dev/null \
+					|file -Ls /dev/stdin |grep -q "Linux.*ext2"; then
+					addDev ${gprov} ${gsize} ext2fs
+				fi
+				;;
+			165)
+				probeDev ${gprov}
+				if [ $? -eq 1 ]; then
+					addDev ${gprov} ${gsize} ufs
+				fi
+				;;
+			esac
+			;;
+		BSD)
+			case "${4}" in
+			7)
+				addDev ${gprov} ${gsize} ufs
+				;;
+			esac
+			;;
+		esac
+	done
+	# partitionless devices with a boot record (eg. emulated floppy disks)
+	# look like empty MBR providers to gpart, so must be probed with file(1)
+	if [ "${gtype}" = "MBR" -a -z "${gprov}" ]; then
+		if ! probeMagic ${dev}; then
+			eval "STATUS_${dev}=novolume"
+		fi
+	fi
+	unset IFS
+	return 0
+}
+
+probeLabel () {
+	local label curlabel curstatus glabel subscriber
+	label=${1}
+	glabel=$(glabel status |grep "${label}")
+	[ $? -eq 0 ] || return 1
+	set -- ${glabel}
+	shift $((${#}-1))
+	eval "curlabel=\$LABEL_${1}"
+	[ -z "${curlabel}" ] || return 0
+	eval "curstatus=\$STATUS_${1}"
+	case "${curstatus}" in
+	novolume)
+		return 1
+		;;
+	umounted|mounted)
+		;;
+	*)
+		addDev ${1} $(diskinfo ${1} |cut -f 3 -d "	") ${label%/*}
+		sleep 0.5
+		;;
+	esac
+	for subscriber in ${SUBSCRIBERS}; do
+		echo "VOLUME LABEL ${1} ${label#*/}" >>${WRKDIR}/fifo.${subscriber} &
+	done
+	eval "LABEL_${1}=\"${label#*/}\""
+	return 0
+}
+
+# $1 = dev node
+# $2 = size in bytes
+# $3 = filesystem
+addDev () {
+	local status subscriber
+	eval "status=\$STATUS_${1}"
+	case "${status}" in
+	umounted|mounted)
+		;;
+	*)
+		eval "STATUS_${1}=umounted"
+		eval "SIZE_${1}=${2}"
+		eval "FS_${1}=${3}"
+		if [ "${3}" = "msdosfs" -a ${2} -gt 68719476736 ]; then
+			# MSDOS volumes larger than 64 GiB
+			eval "MNTCMD_${1}=\"\$MNTCMD_${3} -o large\""
+		else
+			eval "MNTCMD_${1}=\"\$MNTCMD_${3}\""
+		fi
+		MOUNTABLE="${MOUNTABLE} ${1}"
+		for subscriber in ${SUBSCRIBERS}; do
+			echo "VOLUME CREATE ${1} ${3} ${2}" >>${WRKDIR}/fifo.${subscriber} &
+		done
+		;;
+	esac
+}
+
+getInput () {
+	local src cmd data
+	while true; do
+		while read src cmd data <&3; do
+			echo "${src}" |grep -Eq "^[a-z][a-z0-9]+" || continue
+			case "${cmd}" in
+			SUBSCRIBE)
+				echo "!system=VOLMAND ${src} SUBSCRIBE" >${WRKDIR}/internal
+				;;
+			VOLUMES)
+				echo "!system=VOLMAND ${src} VOLUMES" >${WRKDIR}/internal
+				;;
+			MOUNT|UMOUNT)
+				if echo "${data}" |grep -Eq ${DEVMATCH}; then
+					echo "!system=VOLMAND ${src} ${cmd} ${data}" >${WRKDIR}/internal
+				else
+					if [ -e ${WRKDIR}/fifo.${src} ]; then
+						echo "ERROR ${data} unmountable" >${WRKDIR}/fifo.${src}
+					fi
+				fi
+				;;
+			PONG)
+				echo "!system=VOLMAND ${src} PONG" >${WRKDIR}/internal
+				;;
+			esac
+		done 3<${WRKDIR}/fifo.volmand
+	done
+}
+
+pinger () {
+	local subscriber pings subpids keep
+	for subscriber in ${SUBSCRIBERS}; do
+		eval "pings=\$PINGS_${subscriber}"
+		pings=$((${pings}+1))
+		if [ ${pings} -le 3 ]; then
+			keep="${keep} ${subscriber}"
+			echo "PING" >>${WRKDIR}/fifo.${subscriber} &
+			eval "PINGS_${subscriber}=${pings}"
+		else
+			eval "subpids=\"\$SUBPIDS_${subscriber}\""
+			kill ${subpids}
+			rm -f ${WRKDIR}/fifo.${subscriber}
+			unset PINGS_${subscriber} SUBPIDS_${subscriber}
+		fi
+	done
+	SUBSCRIBERS="${keep}"
+	LASTPING=$(date +%s)
+}
+
+# $1 = type paramter
+# $2 = cdev paramter
+msgDevfs () {
+	local probefunc oldmountable mountable fs mntcmd label subscriber
+	if echo ${2} |grep -qE ${DEVMATCH}; then
+		probefunc=probeDev
+	elif echo ${2} |grep -qE ${LABELMATCH}; then
+		probefunc=probeLabel
+	else
+		continue
+	fi
+	log notice ${1} ${2}
+	case "${1}" in
+	CREATE)
+		${probefunc} "${2}"
+		;;
+	DESTROY)
+		if [ "${probefunc}" = "probeDev" ]; then
+			eval "fs=\$FS_${2}"
+			if [ -n "${fs}" ]; then
+				oldmountable=${MOUNTABLE}
+				MOUNTABLE=""
+				for mountable in ${oldmountable}; do
+					[ "${mountable}" != "${2}" ] || continue
+					MOUNTABLE="${MOUNTABLE} ${mountable}"
+				done
+				for subscriber in ${SUBSCRIBERS}; do
+					echo "VOLUME REMOVE ${2}" >>${WRKDIR}/fifo.${subscriber} &
+				done
+				unset FS_${2} SIZE_${2} MNTCMD_${2} LABEL_${2}
+			fi
+			unset STATUS_${2}
+		fi
+		;;
+	esac
+	:>${WRKDIR}/mountable
+	for mountable in ${MOUNTABLE}; do
+		eval "fs=\$FS_${mountable}"
+		eval "mntcmd=\"\$MNTCMD_${mountable}\""
+		eval "label=\$LABEL_${mountable}"
+		printf '%s\t%s\t%s\t%s\n' ${mountable} ${fs} "${mntcmd}" "${label}" >>${WRKDIR}/mountable
+	done
+}
+
+# $1 = subsys
+# $2 = cmd
+# $3+ = data
+msgVolmand () {
+	local pings vol status fs size label mntcmd mdev mpoint subscriber
+	case "${2}" in
+	SUBSCRIBE)
+		eval "pings=\$PINGS_${1}"
+		if [ -z "${pings}" ]; then
+			if mkfifo -m 644 ${WRKDIR}/fifo.${1}; then
+				SUBSCRIBERS="${SUBSCRIBERS} ${1}"
+				cat ${WRKDIR}/block >${WRKDIR}/fifo.${1} &
+				eval "SUBPIDS_${1}=$!"
+				eval "PINGS_${1}=0"
+			fi
+		fi
+		;;
+	VOLUMES)
+		if [ -e ${WRKDIR}/fifo.${1} ]; then
+			(
+			for vol in ${MOUNTABLE}; do
+				eval "status=\$STATUS_${vol}"
+				eval "fs=\$FS_${vol}"
+				eval "size=\$SIZE_${vol}"
+				eval "label=\"\$LABEL_${vol}\""
+				case "${status}" in
+				umounted)
+					echo "VOLUME LIST u ${vol} ${fs} ${size} ${label}" >${WRKDIR}/fifo.${1}
+					;;
+				mounted)
+					echo "VOLUME LIST m ${vol} ${fs} ${size} ${label}" >${WRKDIR}/fifo.${1}
+					;;
+				esac
+			done
+			echo "VOLUME LIST END" >${WRKDIR}/fifo.${1}
+			) &
+		fi
+		;;
+	MOUNT)
+		if [ -e ${WRKDIR}/fifo.${1} ]; then
+			(
+			eval "status=\$STATUS_${3}"
+			case "${status}" in
+			umounted)
+				eval "fs=\$FS_${3}"
+				eval "label=\"\$LABEL_${3}\""
+				eval "mntcmd=\"\$MNTCMD_${3}\""
+				if [ -n "${label}" -a "${DEVMPOINT}" = "NO" ]; then
+					mdev="/dev/${fs}/${label}"
+					mpoint="/media/${label}"
+				else
+					mdev="/dev/${3}"
+					mpoint="/media/${3}"
+				fi
+				if [ -n "${mdev}" -a -n "${mpoint}" ]; then
+					log notice mounting ${mdev} to ${mpoint}
+					if mkdir -p "${mpoint}" && ${mntcmd} "${mdev}" "${mpoint}"; then
+						echo "!system=VOLMAND _mounter STATUS ${3} mounted ${mpoint}" >${WRKDIR}/internal
+					else
+						echo "ERROR ${3} mount error occured" >${WRKDIR}/fifo.${1}
+					fi
+				fi
+				;;
+			mounted)
+				echo "ERROR ${3} volume already mounted" >${WRKDIR}/fifo.${1}
+				;;
+			*)
+				echo "ERROR ${3} volume unmountable" >${WRKDIR}/fifo.${1}
+				;;
+			esac
+			) &
+		fi
+		;;
+	UMOUNT)
+		if [ -e ${WRKDIR}/fifo.${1} ]; then
+			(
+			eval "status=\$STATUS_${3}"
+			case "${status}" in
+			mounted)
+				eval "fs=\$FS_${3}"
+				eval "label=\"\$LABEL_${3}\""
+				if [ -n "${label}" -a "${DEVMPOINT}" = "NO" ]; then
+					mdev="/dev/${fs}/${label}"
+					mpoint="/media/${label}"
+				else
+					mdev="/dev/${3}"
+					mpoint="/media/${3}"
+				fi
+				if [ -n "${mdev}" ]; then
+					log notice umounting ${mdev} from ${mpoint}
+					if umount "${mpoint}"; then
+						rmdir "${mpoint}"
+						echo "!system=VOLMAND _mounter STATUS ${3} umounted ${mpoint}" >${WRKDIR}/internal
+					else
+						echo "ERROR ${3} umount error occured" >${WRKDIR}/fifo.${1}
+					fi
+				fi
+				;;
+			*)
+				echo "ERROR ${3} volume not mounted" >${WRKDIR}/fifo.${1}
+				;;
+			esac
+			) &
+		fi
+		;;
+	PONG)
+		eval "pings=\$PINGS_${1}"
+		if [ -n "${pings}" ]; then
+			eval "PINGS_${1}=0"
+		fi
+		;;
+	ENDPOLL)
+		if [ "${1}" = "_poller" ]; then
+			eval "unset POLLPID_${3}"
+		fi
+		;;
+	STATUS)
+		if [ "${1}" = "_mounter" ]; then
+			vol=${3}
+			status=${4}
+			case "${4}" in
+			mounted)
+				shift 4
+				mntcmd="MOUNT ${vol} ${*}"
+				;;
+			umounted)
+				shift 4
+				mntcmd="UMOUNT ${vol} ${*}"
+				;;
+			esac
+			eval "STATUS_${vol}=${status}"
+			for subscriber in ${SUBSCRIBERS}; do
+				if [ -e ${WRKDIR}/fifo.${subscriber} ]; then
+					echo ${mntcmd} >${WRKDIR}/fifo.${subscriber} &
+				fi
+			done
+		fi
+		;;
+	esac
+}
+
+MASTERPID=$$
+MNTCMD_msdosfs="mount_msdosfs -m 666 -M 777"
+MNTCMD_ext2fs="mount -t ext2fs"
+MNTCMD_ufs="mount -t ufs"
+if kldstat -q -m fuse && test -x /usr/local/bin/ntfs-3g; then
+	MNTCMD_ntfs="/usr/local/bin/ntfs-3g"
+else
+	MNTCMD_ntfs="mount_ntfs -o ro -m 555"
+fi
+OSREL=$(sysctl -n kern.osreldate)
+MNTFILE=mountable
+trap cleanup 1 2 13 14 15 EXIT
+test -d ${WRKDIR} && rm -rf ${WRKDIR}
+mkdir ${WRKDIR} || ( log err unable to create WRKDIR at ${WRKDIR} && exit 1 )
+mkfifo -m 666 ${WRKDIR}/fifo.volmand || ( log err unable to create FIFO at ${WRKDIR}/fifo.volmand && exit 1 )
+mkfifo -m 600 ${WRKDIR}/internal || ( log err unable to create FIFO at ${WRKDIR}/internal && exit 1 )
+mkfifo -m 600 ${WRKDIR}/block || ( log err unable to create FIFO at ${WRKDIR}/block && exit 1 )
+if [ -S /var/run/devd.pipe -a -r /var/run/devd.pipe ]; then
+	cat /var/run/devd.pipe >${WRKDIR}/internal 2>/dev/null &
+	DEVDCATPID=$!
+else
+	log err devd domain socket non-existant or unreadable
+	exit 1
+fi
+
+getInput &
+GETINPUTPID=$!
+
+MOUNTABLE=""
+SUBSCRIBERS=""
+LASTPING=$(date +%s)
+:>${WRKDIR}/mountable
+
+while read SYSTEM SUBSYS TYPE EXTRA <&3; do
+	case "${SYSTEM#*=}" in
+	DEVFS)
+		if [ "${SUBSYS#*=}" = "CDEV" ]; then
+			msgDevfs "${TYPE#*=}" "${EXTRA#cdev=}"
+		fi
+		;;
+	VOLMAND)
+		msgVolmand "${SUBSYS}" "${TYPE}" ${EXTRA}
+		;;
+	esac
+	if [ $(date +%s) -gt $((${LASTPING}+10)) ]; then
+		pinger
+	fi
+done 3<${WRKDIR}/internal

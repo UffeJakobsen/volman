@@ -1,0 +1,100 @@
+#!/bin/sh
+#
+# Volume manager CLI client
+# version 0.7
+
+set -e
+
+if [ -r %%PREFIX%%/etc/volman.conf ]; then
+        . %%PREFIX%%/etc/volman.conf
+fi
+
+: ${WRKDIR:=/tmp/volman}
+
+i=0
+while [ ! -e ${WRKDIR}/fifo.vmount -a ${i} -lt 3 ]; do
+	i=$((${i}+1))
+	echo "vmount SUBSCRIBE" >${WRKDIR}/fifo.volmand
+	sleep 0.5
+done
+
+echo "vmount VOLUMES" >${WRKDIR}/fifo.volmand
+if [ ${#} -eq 1 ]; then
+	DOMOUNT="${1}"
+fi
+
+while read RESP DATA <&3; do
+	case "${RESP}" in
+	VOLUME)
+		set -- ${DATA}
+		if [ "${1}" = "LIST" ]; then
+			case "${2}" in
+			m)
+				out="[m]"
+				if [ "${DOMOUNT}" = "${3}" ]; then
+					echo -n "umounting ${3}... "
+					echo "vmount UMOUNT ${3}" >${WRKDIR}/fifo.volmand
+				fi
+				;;
+			u)
+				out="[u]"
+				if [ "${DOMOUNT}" = "${3}" ]; then
+					echo -n "mounting ${3}... "
+					echo "vmount MOUNT ${3}" >${WRKDIR}/fifo.volmand
+				fi
+				;;
+			END)
+				if [ -n "${DOMOUNT}" ]; then
+					continue
+				else
+					break
+				fi
+				;;
+			esac
+			if [ -z "${DOMOUNT}" ]; then
+				size=${5}
+				unit=B
+				while [ ${size} -gt 1000 ]; do
+					size=$((${size} / 1000))
+					case "${unit}" in
+					B) unit=KB ;;
+					KB) unit=MB ;;
+					MB) unit=GB ;;
+					GB) unit=TB ;;
+					TB) unit=PB ;;
+					esac
+				done
+				out="${out} ${3} ${4} ${size}${unit}"
+				if [ ${#} -gt 5 ]; then
+					shift 5
+					out="${out} ${*}"
+				fi
+				echo ${out}
+			fi
+		fi
+		;;
+	ERROR)
+		echo ERROR: ${DATA}
+		break
+		;;
+	MOUNT)
+		set -- ${DATA}
+		if [ "${1}" = "${DOMOUNT}" ]; then
+			shift
+			echo success: ${*}
+		fi
+		break
+		;;
+	UMOUNT)
+		set -- ${DATA}
+		if [ "${1}" = "${DOMOUNT}" ]; then
+			shift
+			echo success
+		fi
+		break
+		;;
+	PING)
+		echo "vmount PONG" >${WRKDIR}/fifo.volmand
+		;;
+	esac
+done 3<${WRKDIR}/fifo.vmount

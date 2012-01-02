@@ -1,0 +1,120 @@
+#!/bin/sh
+#
+# Volume manager CLI client
+# version 0.7
+
+cleanup () {
+	trap - EXIT
+	if [ -z "${OUTPUT}" ]; then
+		OUTPUT='<item label="Unexpected error"/>'
+	fi
+	if [ -z "${DOMOUNT}" ]; then
+		echo '<openbox_pipe_menu>'
+		printf "${OUTPUT}\\n"
+		echo '</openbox_pipe_menu>'
+	fi
+}
+
+set -e
+trap cleanup EXIT
+
+if [ -r %%PREFIX%%/etc/volman.conf ]; then
+        . %%PREFIX%%/etc/volman.conf
+fi
+
+: ${WRKDIR:=/tmp/volman}
+
+i=0
+while [ ! -e ${WRKDIR}/fifo.obvolman -a ${i} -lt 3 ]; do
+	i=$((${i}+1))
+	echo "obvolman SUBSCRIBE" >${WRKDIR}/fifo.volmand
+	sleep 0.5
+done
+
+echo "obvolman VOLUMES" >${WRKDIR}/fifo.volmand
+if [ ${#} -eq 1 ]; then
+	DOMOUNT="${1}"
+fi
+
+while read RESP DATA <&3; do
+	case "${RESP}" in
+	VOLUME)
+		set -- ${DATA}
+		if [ "${1}" = "LIST" ]; then
+			case "${2}" in
+			m)
+				out="*"
+				if [ "${DOMOUNT}" = "${3}" ]; then
+					echo "obvolman UMOUNT ${3}" >${WRKDIR}/fifo.volmand
+				fi
+				;;
+			u)
+				out=" "
+				if [ "${DOMOUNT}" = "${3}" ]; then
+					echo "obvolman MOUNT ${3}" >${WRKDIR}/fifo.volmand
+				fi
+				;;
+			END)
+				if [ -n "${DOMOUNT}" ]; then
+					continue
+				else
+					if [ -z "${OUTPUT}" ]; then
+						OUTPUT="<item label=\"No devices\"/>"
+					fi
+					break
+				fi
+				;;
+			esac
+			if [ -z "${DOMOUNT}" ]; then
+				size=${5}
+				unit=B
+				while [ ${size} -gt 1000 ]; do
+					size=$((${size} / 1000))
+					case "${unit}" in
+					B) unit=KB ;;
+					KB) unit=MB ;;
+					MB) unit=GB ;;
+					GB) unit=TB ;;
+					TB) unit=PB ;;
+					esac
+				done
+				out="${out} ${3} ${4} ${size}${unit}"
+				dev=${3}
+				if [ ${#} -gt 5 ]; then
+					shift 5
+					out="${out} ${*}"
+				fi
+				OUTPUT="${OUTPUT}<item label=\"${out}\"><action name=\"Execute\">"
+				OUTPUT="${OUTPUT}<command>${0} ${dev}</command></action></item>"
+			fi
+		fi
+		;;
+	ERROR)
+		if [ -z "${DOMOUNT}" ]; then
+			OUTPUT="<item label\"ERROR: ${DATA}\"/>"
+		else
+			xmessage -nearmouse -timeout 5 ERROR: ${DATA}
+		fi
+		break
+		;;
+	MOUNT)
+		set -- ${DATA}
+		if [ "${1}" = "${DOMOUNT}" ]; then
+			shift
+			xmessage -nearmouse -timeout 3 mounted: ${*}
+		fi
+		break
+		;;
+	UMOUNT)
+		set -- ${DATA}
+		if [ "${1}" = "${DOMOUNT}" ]; then
+			shift
+			xmessage -nearmouse -timeout 1 unmounted
+		fi
+		break
+		;;
+	PING)
+		echo "obvolman PONG" >${WRKDIR}/fifo.volmand
+		;;
+	esac
+done 3<${WRKDIR}/fifo.obvolman
