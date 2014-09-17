@@ -13,6 +13,7 @@ is intended for single user X11 systems needing
 an easy way of accessing USB flash disks on the fly.
 
 Originally created by:  Aragon Gouveia (jmptbl)
+
 Now maintained by: Uffe Jakobsen
 
 WWW: http://forums.freebsd.org/showthread.php?t=27233
